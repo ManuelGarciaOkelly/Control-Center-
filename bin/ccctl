@@ -19,7 +19,9 @@
 set -e
 
 V2_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-AGENTS_DIR="$HOME/.config/control-center/agents"
+V2_AGENTS_DIR="$V2_ROOT/packages/agents/src"
+V2_BRIDGES_DIR="$V2_ROOT/packages/bridges/src"
+V1_AGENTS_DIR="$HOME/.config/control-center/agents"
 LOG_DIR="/tmp/cc-v2"
 PID_DIR="$LOG_DIR/pids"
 mkdir -p "$LOG_DIR" "$PID_DIR"
@@ -90,21 +92,28 @@ start_server() {
     return 1
   fi
 
-  CC_V2_PORT="$PORT" PORT="$PORT" \
-  CONTROL_CENTER_TEAM="$TEAM" \
+  CC_PORT="$PORT" PORT="$PORT" \
+  CC_TEAM="$TEAM" \
     launch "server" "$SERVER_PID" "$LOG_DIR/server.log" "$NODE" "$entry"
 
   for i in 1 2 3 4 5 6 7 8 9 10; do
-    curl -sf "$CC_URL/api/agents/health" >/dev/null 2>&1 && break
+    curl -sf "$CC_URL/api/health" >/dev/null 2>&1 && break
     sleep 0.3
   done
 }
 
+# Pick v2 file if present, else v1.
+agent_entry() {
+  local v2="$1" v1="$2"
+  if [ -s "$v2" ]; then echo "$v2"; else echo "$v1"; fi
+}
+
 start_pane_mirror() {
-  CONTROL_CENTER_URL="$CC_URL" \
-  CONTROL_CENTER_TEAM="$TEAM" \
+  local entry; entry=$(agent_entry "$V2_AGENTS_DIR/pane-mirror.js" "$V1_AGENTS_DIR/pane-mirror.mjs")
+  CC_URL="$CC_URL" CC_TEAM="$TEAM" \
+  CONTROL_CENTER_URL="$CC_URL" CONTROL_CENTER_TEAM="$TEAM" \
     launch "pane-mirror" "$MIRROR_PID" "$LOG_DIR/pane-mirror.log" \
-      "$NODE" "$AGENTS_DIR/pane-mirror.mjs"
+      "$NODE" "$entry"
 }
 
 start_tmux_bridge() {
@@ -146,12 +155,13 @@ end tell
 OSA
   fi
 
-  CONTROL_CENTER_URL="$CC_URL" \
-  CONTROL_CENTER_TEAM="$TEAM" \
+  local entry; entry=$(agent_entry "$V2_BRIDGES_DIR/tmux-bridge.js" "$V1_AGENTS_DIR/claude-tmux-bridge.mjs")
+  CC_URL="$CC_URL" CC_TEAM="$TEAM" \
+  CONTROL_CENTER_URL="$CC_URL" CONTROL_CENTER_TEAM="$TEAM" \
   AGENT_NAME="$agent" \
   TMUX_TARGET="$session:0.0" \
     launch "$agent-bridge" "$pidfile" "$LOG_DIR/$agent-bridge.log" \
-      "$NODE" "$AGENTS_DIR/claude-tmux-bridge.mjs"
+      "$NODE" "$entry"
 }
 
 start_claude_bridge() {
@@ -178,10 +188,11 @@ start_gemini_bridge() {
 }
 
 start_watchdog() {
-  CONTROL_CENTER_URL="$CC_URL" \
-  CONTROL_CENTER_TEAM="$TEAM" \
+  local entry; entry=$(agent_entry "$V2_AGENTS_DIR/watchdog.js" "$V1_AGENTS_DIR/watchdog.mjs")
+  CC_URL="$CC_URL" CC_TEAM="$TEAM" \
+  CONTROL_CENTER_URL="$CC_URL" CONTROL_CENTER_TEAM="$TEAM" \
     launch "watchdog" "$WATCHDOG_PID" "$LOG_DIR/watchdog.log" \
-      "$NODE" "$AGENTS_DIR/watchdog.mjs"
+      "$NODE" "$entry"
 }
 
 # ---------- subcommands ----------
@@ -204,9 +215,12 @@ cmd_down() {
   kill_pid "gemini-bridge" "$GEMINI_BRIDGE_PID"
   kill_pid "server" "$SERVER_PID"
   # Belt-and-suspenders sweep — strays that outlived their pidfile
-  pkill -f "claude-tmux-bridge.mjs" 2>/dev/null || true
-  pkill -f "watchdog.mjs"            2>/dev/null || true
-  pkill -f "pane-mirror.mjs"         2>/dev/null || true
+  pkill -f "claude-tmux-bridge.mjs"        2>/dev/null || true
+  pkill -f "tmux-bridge.js"                2>/dev/null || true
+  pkill -f "watchdog.mjs"                  2>/dev/null || true
+  pkill -f "agents/src/watchdog.js"        2>/dev/null || true
+  pkill -f "pane-mirror.mjs"               2>/dev/null || true
+  pkill -f "agents/src/pane-mirror.js"     2>/dev/null || true
   # Tmux sessions left intact so the CLIs keep their warm state.
   echo "-- done. Tmux sessions left intact (use 'ccctl nuke' to also drop them)."
 }
@@ -246,7 +260,7 @@ cmd_status() {
   tmux ls 2>/dev/null | grep -E 'claude-cc|gemini-cc' || echo "  (none)"
   echo ""
   echo "== CC health ($CC_URL) =="
-  curl -sf "$CC_URL/api/agents/health" 2>/dev/null | python3 -m json.tool 2>/dev/null \
+  curl -sf "$CC_URL/api/health" 2>/dev/null | python3 -m json.tool 2>/dev/null \
     || echo "  (server not reachable)"
 }
 
