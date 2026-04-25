@@ -1,0 +1,17 @@
+# This is an example TOML configuration file for Control Center.
+
+[server]
+# The URL where the Control Center server is hosted.
+url = "http://localhost:3000"
+# The default team for the Control Center.
+team = "default"
+# The port the Control Center server listens on.
+port = 3000
+
+[agents]
+# Example agent configuration.
+# agent_name = { url = "http://localhost:XXXX", key = "your_agent_key" }
+
+[bridges]
+# Example bridge configuration.
+# bridge_name = { type = "webhook", url = "http://localhost:YYYY/webhook" }

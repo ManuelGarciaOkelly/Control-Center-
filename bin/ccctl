@@ -1,0 +1,277 @@
+#!/bin/bash
+# Control Center v2 — single on/off switch for server + bridges + watchdog.
+#
+# Usage:
+#   ./bin/ccctl up        # start everything (server, claude bridge, gemini bridge, watchdog)
+#   ./bin/ccctl down      # stop everything
+#   ./bin/ccctl restart   # down + up
+#   ./bin/ccctl status    # show what's running
+#   ./bin/ccctl logs      # tail all component logs
+#
+# Env:
+#   CC_V2_PORT     (default 3000)
+#   CC_V2_TEAM     (default factory-v3)
+#   NO_TERMINAL    (set to skip auto-opening Terminal windows for tmux sessions)
+#
+# Bridges + watchdog are reused from v1 at ~/.config/control-center/agents/
+# (they're transport-agnostic — they talk to whatever CC_URL points at).
+
+set -e
+
+V2_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+AGENTS_DIR="$HOME/.config/control-center/agents"
+LOG_DIR="/tmp/cc-v2"
+PID_DIR="$LOG_DIR/pids"
+mkdir -p "$LOG_DIR" "$PID_DIR"
+
+NODE="/Users/playground/.local/node-v22.13.1-darwin-arm64/bin/node"
+[ -x "$NODE" ] || NODE="$(command -v node)"
+
+PORT="${CC_V2_PORT:-3000}"
+TEAM="${CC_V2_TEAM:-factory-v3}"
+CC_URL="http://localhost:$PORT"
+
+V2_SERVER_ENTRY="$V2_ROOT/packages/server/src/index.js"
+V1_SERVER_ENTRY="$HOME/.config/control-center/server.js"
+SERVER_PID="$PID_DIR/server.pid"
+CLAUDE_BRIDGE_PID="$PID_DIR/claude-bridge.pid"
+GEMINI_BRIDGE_PID="$PID_DIR/gemini-bridge.pid"
+WATCHDOG_PID="$PID_DIR/watchdog.pid"
+MIRROR_PID="$PID_DIR/pane-mirror.pid"
+
+# ---------- helpers ----------
+
+is_alive() { [ -f "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
+
+launch() {
+  local name="$1" pidfile="$2" log="$3"; shift 3
+  if is_alive "$pidfile"; then
+    echo "[$name] already running (PID $(cat "$pidfile"))"
+    return
+  fi
+  nohup "$@" > "$log" 2>&1 &
+  echo $! > "$pidfile"
+  disown
+  echo "[$name] started (PID $!)"
+}
+
+kill_pid() {
+  local name="$1" pidfile="$2"
+  if is_alive "$pidfile"; then
+    kill "$(cat "$pidfile")" 2>/dev/null || true
+    rm -f "$pidfile"
+    echo "[$name] stopped"
+  else
+    echo "[$name] not running"
+    rm -f "$pidfile"
+  fi
+}
+
+# ---------- component starters ----------
+
+start_server() {
+  # Prefer v2 server when it lands; until then fall back to the v1 server so
+  # the single-switch covers the whole stack today.
+  local entry
+  if [ -s "$V2_SERVER_ENTRY" ] && grep -q 'createServer\|listen' "$V2_SERVER_ENTRY" 2>/dev/null; then
+    entry="$V2_SERVER_ENTRY"
+    echo "[server] using v2 entry"
+  elif [ -f "$V1_SERVER_ENTRY" ]; then
+    entry="$V1_SERVER_ENTRY"
+    echo "[server] using v1 entry (v2 not ready yet)"
+  else
+    echo "[server] no server entry found — skipping"
+    return
+  fi
+
+  if lsof -ti ":$PORT" >/dev/null 2>&1 && ! is_alive "$SERVER_PID"; then
+    echo "[server] port $PORT is in use by another process — refusing to start"
+    lsof -i ":$PORT"
+    return 1
+  fi
+
+  CC_V2_PORT="$PORT" PORT="$PORT" \
+  CONTROL_CENTER_TEAM="$TEAM" \
+    launch "server" "$SERVER_PID" "$LOG_DIR/server.log" "$NODE" "$entry"
+
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    curl -sf "$CC_URL/api/agents/health" >/dev/null 2>&1 && break
+    sleep 0.3
+  done
+}
+
+start_pane_mirror() {
+  CONTROL_CENTER_URL="$CC_URL" \
+  CONTROL_CENTER_TEAM="$TEAM" \
+    launch "pane-mirror" "$MIRROR_PID" "$LOG_DIR/pane-mirror.log" \
+      "$NODE" "$AGENTS_DIR/pane-mirror.mjs"
+}
+
+start_tmux_bridge() {
+  # Generic tmux-bridge starter. Args:
+  #   $1 = logical agent name (claude|gemini)
+  #   $2 = tmux session name
+  #   $3 = inner CLI cmd (claude ... | gemini ...)
+  #   $4 = workspace dir
+  #   $5 = pidfile
+  local agent="$1" session="$2" inner_cmd="$3" workspace="$4" pidfile="$5"
+
+  if ! command -v tmux >/dev/null 2>&1; then
+    echo "[$agent-bridge] tmux not installed — skipping"
+    return
+  fi
+
+  # Strip Claude-Desktop-inherited env leaking into tmux global env
+  for v in ANTHROPIC_API_KEY ANTHROPIC_BASE_URL CLAUDECODE CLAUDE_AGENT_SDK_VERSION \
+           CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_EXECPATH \
+           CLAUDE_INTERNAL_FC_OVERRIDES __CFBundleIdentifier; do
+    tmux setenv -gu "$v" 2>/dev/null || true
+  done
+
+  if ! tmux has-session -t "$session" 2>/dev/null; then
+    mkdir -p "$workspace"
+    tmux new-session -d -s "$session" -c "$workspace" "$inner_cmd"
+    echo "[$agent-bridge] spawned tmux session '$session'"
+    sleep 1
+  else
+    echo "[$agent-bridge] reusing tmux session '$session'"
+  fi
+
+  if [ "$(uname)" = "Darwin" ] && [ -z "$NO_TERMINAL" ]; then
+    osascript <<OSA 2>/dev/null || true
+tell application "Terminal"
+  activate
+  do script "tmux attach -t $session"
+end tell
+OSA
+  fi
+
+  CONTROL_CENTER_URL="$CC_URL" \
+  CONTROL_CENTER_TEAM="$TEAM" \
+  AGENT_NAME="$agent" \
+  TMUX_TARGET="$session:0.0" \
+    launch "$agent-bridge" "$pidfile" "$LOG_DIR/$agent-bridge.log" \
+      "$NODE" "$AGENTS_DIR/claude-tmux-bridge.mjs"
+}
+
+start_claude_bridge() {
+  local model="${CLAUDE_CLI_MODEL:-sonnet}"
+  local cmd="${CLAUDE_CMD:-claude --model $model --dangerously-skip-permissions}"
+  local ws="${CLAUDE_WORKSPACE:-$HOME/.config/control-center/claude-workspace}"
+  start_tmux_bridge "claude" "${CLAUDE_TMUX_SESSION:-claude-cc}" \
+    "unset ANTHROPIC_API_KEY; exec $cmd" "$ws" "$CLAUDE_BRIDGE_PID"
+}
+
+start_gemini_bridge() {
+  local bin="gemini"
+  command -v gemini >/dev/null 2>&1 || {
+    for p in /Users/playground/.local/node-v22.13.1-darwin-arm64/bin/gemini \
+             /Users/playground/.local/node-v22.12.0-darwin-arm64/bin/gemini; do
+      [ -x "$p" ] && bin="$p" && break
+    done
+  }
+  local model="${GEMINI_MODEL:-gemini-2.5-flash}"
+  local cmd="${GEMINI_CMD:-$bin --model $model --yolo}"
+  local ws="${GEMINI_WORKSPACE:-$HOME/.config/control-center/gemini-workspace}"
+  start_tmux_bridge "gemini" "${GEMINI_TMUX_SESSION:-gemini-cc}" \
+    "unset GEMINI_API_KEY; exec $cmd" "$ws" "$GEMINI_BRIDGE_PID"
+}
+
+start_watchdog() {
+  CONTROL_CENTER_URL="$CC_URL" \
+  CONTROL_CENTER_TEAM="$TEAM" \
+    launch "watchdog" "$WATCHDOG_PID" "$LOG_DIR/watchdog.log" \
+      "$NODE" "$AGENTS_DIR/watchdog.mjs"
+}
+
+# ---------- subcommands ----------
+
+cmd_up() {
+  echo "== Control Center UP (port=$PORT, team=$TEAM) =="
+  start_server
+  start_claude_bridge
+  start_gemini_bridge
+  start_watchdog
+  start_pane_mirror
+  echo "-- done. 'ccctl status' to verify."
+}
+
+cmd_down() {
+  echo "== Control Center DOWN =="
+  kill_pid "pane-mirror" "$MIRROR_PID"
+  kill_pid "watchdog" "$WATCHDOG_PID"
+  kill_pid "claude-bridge" "$CLAUDE_BRIDGE_PID"
+  kill_pid "gemini-bridge" "$GEMINI_BRIDGE_PID"
+  kill_pid "server" "$SERVER_PID"
+  # Belt-and-suspenders sweep — strays that outlived their pidfile
+  pkill -f "claude-tmux-bridge.mjs" 2>/dev/null || true
+  pkill -f "watchdog.mjs"            2>/dev/null || true
+  pkill -f "pane-mirror.mjs"         2>/dev/null || true
+  # Tmux sessions left intact so the CLIs keep their warm state.
+  echo "-- done. Tmux sessions left intact (use 'ccctl nuke' to also drop them)."
+}
+
+cmd_nuke() {
+  cmd_down
+  for s in claude-cc gemini-cc; do
+    tmux kill-session -t "$s" 2>/dev/null && echo "  killed tmux session $s" || true
+  done
+  echo "-- nuked."
+}
+
+cmd_restart() { cmd_down; sleep 1; cmd_up; }
+
+cmd_toggle() {
+  if is_alive "$SERVER_PID" || is_alive "$WATCHDOG_PID" || is_alive "$MIRROR_PID"; then
+    cmd_down
+  else
+    cmd_up
+  fi
+}
+
+cmd_status() {
+  echo "== v2 processes =="
+  for p in "server:$SERVER_PID" "claude-bridge:$CLAUDE_BRIDGE_PID" \
+           "gemini-bridge:$GEMINI_BRIDGE_PID" "watchdog:$WATCHDOG_PID" \
+           "pane-mirror:$MIRROR_PID"; do
+    name="${p%%:*}"; pf="${p##*:}"
+    if is_alive "$pf"; then
+      echo "  $name: UP (PID $(cat "$pf"))"
+    else
+      echo "  $name: DOWN"
+    fi
+  done
+  echo ""
+  echo "== tmux sessions =="
+  tmux ls 2>/dev/null | grep -E 'claude-cc|gemini-cc' || echo "  (none)"
+  echo ""
+  echo "== CC health ($CC_URL) =="
+  curl -sf "$CC_URL/api/agents/health" 2>/dev/null | python3 -m json.tool 2>/dev/null \
+    || echo "  (server not reachable)"
+}
+
+cmd_logs() {
+  echo "Tailing $LOG_DIR/*.log — Ctrl-C to stop"
+  tail -n 20 -F "$LOG_DIR"/*.log 2>/dev/null
+}
+
+case "${1:-help}" in
+  up|start)      cmd_up ;;
+  down|stop)     cmd_down ;;
+  toggle)        cmd_toggle ;;
+  restart)       cmd_restart ;;
+  nuke)          cmd_nuke ;;
+  status)        cmd_status ;;
+  logs)          cmd_logs ;;
+  *)
+    echo "Usage: $0 {up|down|toggle|restart|nuke|status|logs}"
+    echo "  up      — start everything"
+    echo "  down    — stop everything (keep tmux sessions warm)"
+    echo "  toggle  — flip current state"
+    echo "  nuke    — down + kill tmux sessions"
+    echo "  restart — down + up"
+    echo "  status  — show what's running"
+    echo "  logs    — tail all component logs"
+    exit 1
+    ;;
+esac

@@ -1,0 +1,1 @@
+{"name":"@cc/root","version":"0.0.0","private":true,"type":"module","workspaces":["packages/*"],"scripts":{"start":"node packages/cli/src/cc.js","dev":"node packages/cli/src/cc.js","test":"echo no-tests","fmt":"prettier --write ."},"devDependencies":{"prettier":"^3.0.0"}}
