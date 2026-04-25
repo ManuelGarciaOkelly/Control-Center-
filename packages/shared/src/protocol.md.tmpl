@@ -23,7 +23,7 @@ chrome (status bars, prompt boxes) and keeps the prose.
 When you finish a task — pass or fail — make exactly one HTTP call:
 
 ```
-PATCH http://localhost:3000/api/tasks/<your-task-id>
+PATCH {{CC_URL}}/api/tasks/<your-task-id>
 Content-Type: application/json
 
 { "status": "completed" | "failed", "result": "<one-line summary>" }

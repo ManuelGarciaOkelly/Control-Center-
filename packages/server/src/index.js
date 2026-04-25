@@ -4,10 +4,10 @@
 // live in sse.js. State is in-memory + JSON-persisted (see state.js / persistence.js).
 
 import { createServer } from 'node:http';
-import { readFile } from 'node:fs/promises';
+import { readFile, realpath } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { bootstrap, flush } from './state.js';
 import { send, sendError } from './http-utils.js';
@@ -84,7 +84,19 @@ export async function startServer({ port = PORT } = {}) {
   return server;
 }
 
-// Boot when run directly.
-if (import.meta.url === `file://${process.argv[1]}`) {
-  startServer().catch(e => { console.error('[server] boot failed:', e); process.exit(1); });
+// Boot when run directly. Resolve symlinks on both sides — the repo path may
+// be a symlink (e.g. ~/git/control-center-v2 -> ~/.config/.../control-center-v2),
+// in which case import.meta.url and argv[1] disagree without realpath.
+if (process.argv[1]) {
+  try {
+    const argvUrl = pathToFileURL(await realpath(process.argv[1])).href;
+    if (import.meta.url === argvUrl) {
+      startServer().catch(e => { console.error('[server] boot failed:', e); process.exit(1); });
+    }
+  } catch (e) {
+    // Fall back to naive comparison if realpath fails.
+    if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+      startServer().catch(e => { console.error('[server] boot failed:', e); process.exit(1); });
+    }
+  }
 }

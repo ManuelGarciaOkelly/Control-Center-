@@ -32,6 +32,7 @@ export async function renderProtocol({ agent, config, templatePath } = {}) {
     : '_(no peers configured — single-agent setup)_';
 
   const tmuxTarget = config.tmux?.[agent]?.target || `${agent}-cc:0.0`;
+  const ccUrl = config.ccUrl || 'http://localhost:3002';
 
   const tmpl = await readFile(templatePath || DEFAULT_TEMPLATE_PATH, 'utf8');
 
@@ -40,7 +41,8 @@ export async function renderProtocol({ agent, config, templatePath } = {}) {
     .replaceAll('{{TEAM}}', team)
     .replaceAll('{{PEER_LIST}}', peerList)
     .replaceAll('{{CODE_GUIDELINES}}', config.codeGuidelines || DEFAULT_GUIDELINES)
-    .replaceAll('{{TMUX_TARGET}}', tmuxTarget);
+    .replaceAll('{{TMUX_TARGET}}', tmuxTarget)
+    .replaceAll('{{CC_URL}}', ccUrl);
 
   if (rendered.includes('{{')) {
     const stray = rendered.match(/\{\{[^}]+\}\}/g);
