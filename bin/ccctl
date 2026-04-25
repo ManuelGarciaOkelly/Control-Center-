@@ -21,7 +21,6 @@ set -e
 V2_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 V2_AGENTS_DIR="$V2_ROOT/packages/agents/src"
 V2_BRIDGES_DIR="$V2_ROOT/packages/bridges/src"
-V1_AGENTS_DIR="$HOME/.config/control-center/agents"
 LOG_DIR="/tmp/cc-v2"
 PID_DIR="$LOG_DIR/pids"
 mkdir -p "$LOG_DIR" "$PID_DIR"
@@ -29,12 +28,11 @@ mkdir -p "$LOG_DIR" "$PID_DIR"
 NODE="/Users/playground/.local/node-v22.13.1-darwin-arm64/bin/node"
 [ -x "$NODE" ] || NODE="$(command -v node)"
 
-PORT="${CC_V2_PORT:-3000}"
+PORT="${CC_V2_PORT:-3002}"  # v1 owns 3000; v2 lives on 3002 to coexist.
 TEAM="${CC_V2_TEAM:-factory-v3}"
 CC_URL="http://localhost:$PORT"
 
 V2_SERVER_ENTRY="$V2_ROOT/packages/server/src/index.js"
-V1_SERVER_ENTRY="$HOME/.config/control-center/server.js"
 SERVER_PID="$PID_DIR/server.pid"
 CLAUDE_BRIDGE_PID="$PID_DIR/claude-bridge.pid"
 GEMINI_BRIDGE_PID="$PID_DIR/gemini-bridge.pid"
@@ -72,19 +70,13 @@ kill_pid() {
 # ---------- component starters ----------
 
 start_server() {
-  # Prefer v2 server when it lands; until then fall back to the v1 server so
-  # the single-switch covers the whole stack today.
-  local entry
-  if [ -s "$V2_SERVER_ENTRY" ] && grep -q 'createServer\|listen' "$V2_SERVER_ENTRY" 2>/dev/null; then
-    entry="$V2_SERVER_ENTRY"
-    echo "[server] using v2 entry"
-  elif [ -f "$V1_SERVER_ENTRY" ]; then
-    entry="$V1_SERVER_ENTRY"
-    echo "[server] using v1 entry (v2 not ready yet)"
-  else
-    echo "[server] no server entry found — skipping"
-    return
+  # v2-only. ccctl never starts the v1 server — v1 is managed independently.
+  if [ ! -s "$V2_SERVER_ENTRY" ]; then
+    echo "[server] v2 entry missing at $V2_SERVER_ENTRY — aborting"
+    return 1
   fi
+  local entry="$V2_SERVER_ENTRY"
+  echo "[server] using v2 entry"
 
   if lsof -ti ":$PORT" >/dev/null 2>&1 && ! is_alive "$SERVER_PID"; then
     echo "[server] port $PORT is in use by another process — refusing to start"
@@ -102,18 +94,10 @@ start_server() {
   done
 }
 
-# Pick v2 file if present, else v1.
-agent_entry() {
-  local v2="$1" v1="$2"
-  if [ -s "$v2" ]; then echo "$v2"; else echo "$v1"; fi
-}
-
 start_pane_mirror() {
-  local entry; entry=$(agent_entry "$V2_AGENTS_DIR/pane-mirror.js" "$V1_AGENTS_DIR/pane-mirror.mjs")
   CC_URL="$CC_URL" CC_TEAM="$TEAM" \
-  CONTROL_CENTER_URL="$CC_URL" CONTROL_CENTER_TEAM="$TEAM" \
     launch "pane-mirror" "$MIRROR_PID" "$LOG_DIR/pane-mirror.log" \
-      "$NODE" "$entry"
+      "$NODE" "$V2_AGENTS_DIR/pane-mirror.js"
 }
 
 start_tmux_bridge() {
@@ -155,13 +139,11 @@ end tell
 OSA
   fi
 
-  local entry; entry=$(agent_entry "$V2_BRIDGES_DIR/tmux-bridge.js" "$V1_AGENTS_DIR/claude-tmux-bridge.mjs")
   CC_URL="$CC_URL" CC_TEAM="$TEAM" \
-  CONTROL_CENTER_URL="$CC_URL" CONTROL_CENTER_TEAM="$TEAM" \
   AGENT_NAME="$agent" \
   TMUX_TARGET="$session:0.0" \
     launch "$agent-bridge" "$pidfile" "$LOG_DIR/$agent-bridge.log" \
-      "$NODE" "$entry"
+      "$NODE" "$V2_BRIDGES_DIR/tmux-bridge.js"
 }
 
 start_claude_bridge() {
@@ -188,11 +170,9 @@ start_gemini_bridge() {
 }
 
 start_watchdog() {
-  local entry; entry=$(agent_entry "$V2_AGENTS_DIR/watchdog.js" "$V1_AGENTS_DIR/watchdog.mjs")
   CC_URL="$CC_URL" CC_TEAM="$TEAM" \
-  CONTROL_CENTER_URL="$CC_URL" CONTROL_CENTER_TEAM="$TEAM" \
     launch "watchdog" "$WATCHDOG_PID" "$LOG_DIR/watchdog.log" \
-      "$NODE" "$entry"
+      "$NODE" "$V2_AGENTS_DIR/watchdog.js"
 }
 
 # ---------- subcommands ----------
@@ -215,12 +195,10 @@ cmd_down() {
   kill_pid "gemini-bridge" "$GEMINI_BRIDGE_PID"
   kill_pid "server" "$SERVER_PID"
   # Belt-and-suspenders sweep — strays that outlived their pidfile
-  pkill -f "claude-tmux-bridge.mjs"        2>/dev/null || true
-  pkill -f "tmux-bridge.js"                2>/dev/null || true
-  pkill -f "watchdog.mjs"                  2>/dev/null || true
-  pkill -f "agents/src/watchdog.js"        2>/dev/null || true
-  pkill -f "pane-mirror.mjs"               2>/dev/null || true
-  pkill -f "agents/src/pane-mirror.js"     2>/dev/null || true
+  # v2-only patterns — must NEVER match v1 paths under ~/.config/control-center/.
+  pkill -f "control-center-v2/packages/bridges/src/tmux-bridge.js" 2>/dev/null || true
+  pkill -f "control-center-v2/packages/agents/src/watchdog.js"     2>/dev/null || true
+  pkill -f "control-center-v2/packages/agents/src/pane-mirror.js"  2>/dev/null || true
   # Tmux sessions left intact so the CLIs keep their warm state.
   echo "-- done. Tmux sessions left intact (use 'ccctl nuke' to also drop them)."
 }
