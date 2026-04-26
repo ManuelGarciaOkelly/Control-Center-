@@ -16,12 +16,13 @@ import { handleTasks } from './routes/tasks.js';
 import { handleHeartbeat } from './routes/heartbeat.js';
 import { handleAgents } from './routes/agents.js';
 import { handleTeams } from './routes/teams.js';
+import { handleControl } from './routes/control.js';
 import { handleEvents, handleAgentEvents } from './sse.js';
 import { startSweeper, stopSweeper } from './sweeper.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.CC_PORT || 3000);
-const DASHBOARD_DIR = resolve(__dirname, '../../dashboard/src');
+const DASHBOARD_DIR = resolve(__dirname, '../../dashboard/src/public');
 
 async function serveDashboard(req, res, url) {
   // Map / -> /index.html, otherwise serve file by name (no traversal).
@@ -49,6 +50,7 @@ async function router(req, res) {
     if (p === '/api/heartbeat') return await handleHeartbeat(req, res);
     if (p === '/api/agents') return handleAgents(req, res, url);
     if (p.startsWith('/api/teams')) return await handleTeams(req, res, url);
+    if (p.startsWith('/api/control')) return await handleControl(req, res, url);
     if (p === '/api/events') return handleEvents(req, res, url);
     if (p === '/api/agent-events') return handleAgentEvents(req, res, url);
 

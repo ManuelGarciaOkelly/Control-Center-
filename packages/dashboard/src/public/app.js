@@ -17,7 +17,7 @@ function render() {
 
     // Update tab active classes
     document.querySelectorAll('nav .tab-button').forEach(button => {
-        if (button.dataset.tab === state.activeTab) {
+        if (button.textContent.toLowerCase() === state.activeTab) {
             button.classList.add('active');
         } else {
             button.classList.remove('active');
@@ -41,52 +41,40 @@ function render() {
 
 
     if (state.activeTab === 'tasks') {
-        // Render tasks table
-        const taskTable = document.createElement('table');
-        taskTable.innerHTML = `
-            <thead>
-                <tr>
-                    <th>ID</th>
-                    <th>Assign To</th>
-                    <th>Type</th>
-                    <th>Status</th>
-                    <th>Age</th>
-                    <th>Result</th>
-                </tr>
-            </thead>
-            <tbody></tbody>
-        `;
-        const tbody = taskTable.querySelector('tbody');
-
-        const sortedTasks = Array.from(state.tasks.values()).sort((a, b) => b.id - a.id); // Fixed: numeric sort for IDs
+        const sortedTasks = Array.from(state.tasks.values()).sort((a, b) => b.id - a.id);
+        const escape = (s) => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        const truncate = (s, n) => (s && s.length > n) ? s.slice(0, n) + '…' : (s || '');
 
         sortedTasks.forEach(task => {
-            const row = tbody.insertRow();
-            row.className = 'task-row';
-            row.dataset.taskId = task.id; // Store task ID for modal
+            const prompt = task.payload && task.payload.message ? task.payload.message : JSON.stringify(task.payload || {}, null, 2);
+            const details = document.createElement('details');
+            details.className = `task task-status-${task.status}`;
 
-            // Add status class for coloring
-            let statusClass = '';
-            switch (task.status) {
-                case 'completed': statusClass = 'status-completed'; break;
-                case 'failed': statusClass = 'status-failed'; break;
-                case 'in_progress': statusClass = 'status-in-progress'; break;
-                case 'pending': statusClass = 'status-pending'; break;
-                case 'awaiting-approval': statusClass = 'status-awaiting-approval'; break;
-                default: statusClass = '';
-            }
-
-            row.innerHTML = `
-                <td>${task.id}</td>
-                <td>${task.assignTo || 'N/A'}</td>
-                <td>${task.type || 'N/A'}</td>
-                <td class="${statusClass}">${task.status || 'N/A'}</td>
-                <td>${formatTaskAge(task.createdAt)}</td>
-                <td>${task.result || ''}</td>
+            const summary = document.createElement('summary');
+            summary.innerHTML = `
+                <span class="task-id">#${task.id}</span>
+                <span class="task-assign">${escape(task.assignTo || '?')}</span>
+                <span class="task-status-badge">${escape(task.status || '?')}</span>
+                <span class="task-age">${formatTaskAge(task.createdAt)}</span>
+                <span class="task-preview">${escape(truncate(prompt.split('\n')[0], 100))}</span>
             `;
-            row.addEventListener('click', () => showTaskModal(task));
+            details.appendChild(summary);
+
+            const body = document.createElement('div');
+            body.className = 'task-body';
+            body.innerHTML = `
+                <div class="task-section"><div class="task-label">prompt</div><pre>${escape(prompt)}</pre></div>
+                ${task.result ? `<div class="task-section"><div class="task-label">result</div><pre>${escape(task.result)}</pre></div>` : ''}
+                ${task.status === 'awaiting-approval' ? `<button class="approve-btn" data-id="${task.id}">[Approve]</button>` : ''}
+            `;
+            details.appendChild(body);
+            const approve = body.querySelector('.approve-btn');
+            if (approve) approve.addEventListener('click', async (e) => {
+                e.preventDefault();
+                await fetch(`/api/tasks/${task.id}/approve`, { method: 'POST' });
+            });
+            streamElement.appendChild(details);
         });
-        streamElement.appendChild(taskTable);
 
     } else {
         // Render messages
@@ -106,19 +94,36 @@ function render() {
             return false;
         });
 
-        filteredMessages.forEach(msg => {
-            const msgDiv = document.createElement('div');
-            msgDiv.className = 'msg';
+        // Newest first.
+        const ordered = filteredMessages.slice().reverse();
+        const fmtTime = (ts) => {
+            if (!ts) return '';
+            const d = new Date(ts);
+            return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        };
+        const truncate = (s, n) => (s && s.length > n) ? s.slice(0, n) + '…' : (s || '');
 
-            const fromSpan = document.createElement('span');
-            fromSpan.className = 'from';
-            fromSpan.textContent = msg.from;
-            msgDiv.appendChild(fromSpan);
-            msgDiv.appendChild(document.createTextNode(` ${msg.text}`));
-            streamElement.appendChild(msgDiv);
+        ordered.forEach(msg => {
+            const text = msg.text || '';
+            const isLong = text.length > 140 || text.includes('\n');
+            const details = document.createElement('details');
+            details.className = `msg from-${(msg.from || 'unknown').replace(/[^a-z0-9_-]/gi, '_')}`;
+            if (!isLong) details.open = true;
+
+            const summary = document.createElement('summary');
+            summary.innerHTML = `<span class="ts">${fmtTime(msg.timestamp)}</span> <span class="from">${msg.from || '?'}</span> <span class="preview">${truncate(text.split('\n')[0], 120)}</span>`;
+            details.appendChild(summary);
+
+            if (isLong) {
+                const body = document.createElement('pre');
+                body.className = 'body';
+                body.textContent = text;
+                details.appendChild(body);
+            }
+            streamElement.appendChild(details);
         });
 
-        streamElement.scrollTop = streamElement.scrollHeight; // Scroll to bottom
+        streamElement.scrollTop = 0; // Newest at top
     }
 }
 
@@ -127,7 +132,7 @@ function updateHeaderDots() {
     const geminiDot = document.getElementById('dot-gemini');
     const claudeDot = document.getElementById('dot-claude');
     const headerButtonsContainer = document.querySelector('header .header-buttons');
-    let transitioningIndicator = document.getElementById('transitioning-indicator');
+    const transitioningIndicator = document.getElementById('transitioning-indicator');
 
     if (state.eventSourceConnected) {
         brokerDot.className = 'status-dot ok';
@@ -149,8 +154,7 @@ function updateHeaderDots() {
         .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
         .slice(0, 5)
         .map(task => `${task.id}: ${task.status}`)
-        .join('
-');
+        .join('\n');
     brokerDot.title = `Broker Status:
 ${state.eventSourceConnected ? 'Online' : 'Offline'}
 
@@ -158,17 +162,14 @@ Last 5 tasks:
 ${lastFiveTasks || 'No tasks yet'}`;
 
 
-    // Update agent dots
+    // Update agent dots: stale → warn, missing → down, alive → ok.
     ['gemini', 'claude'].forEach(agentName => {
         const agent = state.agents.get(agentName);
         const dot = document.getElementById(`dot-${agentName}`);
-        if (dot) {
-            let status = 'down'; // Default to down
-            if (agent && agent.status) {
-                status = agent.status; // Directly use reported status
-            }
-            dot.className = `status-dot ${status}`;
-        }
+        if (!dot) return;
+        let cls = 'down';
+        if (agent) cls = agent.stale ? 'warn' : 'ok';
+        dot.className = `status-dot ${cls}`;
     });
 }
 
@@ -181,18 +182,11 @@ async function fetchInitialState() {
         ]);
 
         const messagesData = await messagesResponse.json();
-        const tasksData = await tasksResponse.json(); // Assuming { tasks: [...] }
-        const agentsData = await agentsResponse.json(); // Fixed: unwrapping agents response
+        const tasksData = await tasksResponse.json();
+        const agentsData = await agentsResponse.json();
 
-        state.messages = messagesData.messages || []; // Fixed: unwrapping messages response
-        // Adjust for the { tasks: [...] } quirk
-        if (tasksData && Array.isArray(tasksData.tasks)) {
-            tasksData.tasks.forEach(task => state.tasks.set(task.id, task));
-        } else if (Array.isArray(tasksData)) { // Fallback if it's just an array
-             tasksData.forEach(task => state.tasks.set(task.id, task));
-        }
-        
-        // Fixed: unwrapping agents response and using agent.agent as key
+        state.messages = messagesData.messages || [];
+        (tasksData.tasks || []).forEach(task => state.tasks.set(task.id, task));
         (agentsData.agents || []).forEach(agent => state.agents.set(agent.agent, agent));
 
         render();
@@ -233,27 +227,35 @@ function setupEventSource() {
     };
 
     function setupEventSourceListeners(es) {
+        // Broker only emits the default `message` event. Payload shape:
+        //   { type: 'message', message: { id, team, from, text, type, timestamp, data? } }
+        // Inner message.type may be 'chat' or 'task-update' (carries data.taskId/status).
         es.addEventListener('message', (event) => {
-            const data = JSON.parse(event.data);
-            state.messages.push(data);
+            let env;
+            try { env = JSON.parse(event.data); } catch { return; }
+            if (env.type !== 'message' || !env.message) return;
+            const m = env.message;
+            state.messages.push(m);
+            if (m.type === 'task-update' && m.data && m.data.taskId) {
+                const existing = state.tasks.get(m.data.taskId) || { id: m.data.taskId };
+                state.tasks.set(m.data.taskId, { ...existing, status: m.data.status, result: m.data.result });
+            }
             render();
-        });
-
-        es.addEventListener('task-update', (event) => {
-            const data = JSON.parse(event.data);
-            state.tasks.set(data.id, data);
-            render(); // Re-render to update tasks table if active tab
-        });
-
-        es.addEventListener('agent-status', (event) => {
-            const data = JSON.parse(event.data);
-            // Fixed: using agent.agent as key
-            state.agents.set(data.agent, data);
-            updateHeaderDots();
         });
     }
 
     setupEventSourceListeners(eventSource);
+
+    // Agent health isn't pushed via SSE — poll every 5s.
+    setInterval(async () => {
+        try {
+            const r = await fetch('/api/agents');
+            const d = await r.json();
+            state.agents = new Map();
+            (d.agents || []).forEach(a => state.agents.set(a.agent, a));
+            updateHeaderDots();
+        } catch {}
+    }, 5000);
 }
 
 // Helper functions for tasks tab
@@ -364,7 +366,7 @@ function closeModal() {
 }
 
 async function handleControlAction(action) {
-    const headerButtons = document.querySelectorAll('header .header-buttons button'); // Corrected selector
+    const headerButtons = document.querySelectorAll('header button');
     const headerButtonsContainer = document.querySelector('header .header-buttons');
     let transitioningIndicator = document.getElementById('transitioning-indicator');
 
@@ -443,8 +445,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Setup tab switching
     document.querySelectorAll('nav .tab-button').forEach(button => {
-        button.addEventListener('click', (e) => {
-            state.activeTab = e.target.dataset.tab; // Fixed: use dataset.tab
+        button.addEventListener('click', () => {
+            state.activeTab = button.textContent.toLowerCase();
             render();
         });
     });
@@ -465,7 +467,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     // Control button listeners
-    document.getElementById('btn-up').addEventListener('click', () => handleControlAction('up')); // Fixed: use IDs
-    document.getElementById('btn-down').addEventListener('click', () => handleControlAction('down')); // Fixed: use IDs
-    document.getElementById('btn-restart').addEventListener('click', () => handleControlAction('restart')); // Fixed: use IDs
+    document.querySelector('header button:nth-child(1)').addEventListener('click', () => handleControlAction('up'));
+    document.querySelector('header button:nth-child(2)').addEventListener('click', () => handleControlAction('down'));
+    document.querySelector('header button:nth-child(3)').addEventListener('click', () => handleControlAction('restart'));
 });

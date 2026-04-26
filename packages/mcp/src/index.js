@@ -7,7 +7,18 @@
 //   cc2_get_task        — single task by id
 //   cc2_list_agents     — agent health snapshot
 //   cc2_create_task     — dispatch new task to a worker
+//   cc2_create_sequence — dispatch a serial chain (step N+1 fires when N completes)
 //   cc2_approve_task    — promote awaiting-approval -> queued (gated tasks)
+//
+// Worker roster (factory-v3 team):
+//   "claude" — Claude Sonnet, headed worker. Use for reasoning, code review,
+//              ambiguous specs, multi-file refactors. Slow + expensive.
+//   "gemini" — Gemini 2.5 Flash, --yolo. Use for cheap mechanical work:
+//              boilerplate, format conversions, scaffolding, single-file edits
+//              with crisp specs. Fast + cheap, but easily confused by ambiguity.
+//
+// Rule of thumb: decompose with claude (orchestrator), execute mechanical
+// steps with gemini, escalate to claude-worker only when reasoning is needed.
 //
 // Workers do NOT use this MCP — they reply via tmux pane + PATCH HTTP per
 // Protocol v1.4. This is an orchestrator/observer tool only.
@@ -91,7 +102,7 @@ const TOOLS = [
   },
   {
     name: 'cc2_create_task',
-    description: 'Dispatch a new task to a worker. Goes immediately into the queue (or awaiting-approval if gated).',
+    description: 'Dispatch a new task to a worker. Goes immediately into the queue (or awaiting-approval if gated). Workers: "gemini" (Flash, cheap+fast, mechanical work, crisp specs only) | "claude" (Sonnet, reasoning + ambiguous specs, slow+expensive). For multi-step work where steps must run in order, use cc2_create_sequence instead — it lets the worker run uninterrupted.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -103,6 +114,26 @@ const TOOLS = [
         gated: { type: 'boolean', description: 'If true, task starts in awaiting-approval (CEO must approve via cc2_approve_task)' },
       },
       required: ['team', 'assignTo', 'type', 'payload'],
+    },
+  },
+  {
+    name: 'cc2_create_sequence',
+    description: 'Atomically create a serial chain of tasks for one worker. Step 0 dispatches immediately; each subsequent step queues automatically when the previous one PATCHes status=completed. On failure the rest are cancelled (unless continueOnFailure=true). Use when you have N ordered sub-tasks and want the worker to plow through without round-tripping for each one.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        team: { type: 'string' },
+        assignTo: { type: 'string', description: 'Worker name ("gemini" | "claude") — applies to all steps unless a step overrides it.' },
+        type: { type: 'string', description: 'e.g. "message" | "code" — applies to all steps unless overridden.' },
+        gated: { type: 'boolean', description: 'If true, step 0 starts in awaiting-approval.' },
+        continueOnFailure: { type: 'boolean', description: 'If true, failure of step N still queues step N+1.' },
+        steps: {
+          type: 'array',
+          description: 'Array of step payloads. Each item is a payload object (e.g. {message:"..."}), or {payload:{...}, type?, assignTo?, team?} to override per-step.',
+          items: { type: 'object' },
+        },
+      },
+      required: ['team', 'assignTo', 'type', 'steps'],
     },
   },
   {
@@ -148,6 +179,11 @@ async function handleToolCall(name, args) {
     }
     case 'cc2_create_task': {
       const res = await hubRequest('POST', '/api/tasks', args);
+      if (res.status >= 400) return `Error (${res.status}): ${JSON.stringify(res.body)}`;
+      return JSON.stringify(res.body, null, 2);
+    }
+    case 'cc2_create_sequence': {
+      const res = await hubRequest('POST', '/api/tasks/sequence', args);
       if (res.status >= 400) return `Error (${res.status}): ${JSON.stringify(res.body)}`;
       return JSON.stringify(res.body, null, 2);
     }
