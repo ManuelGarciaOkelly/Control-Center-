@@ -32,6 +32,66 @@ PORT="${CC_V2_PORT:-3002}"  # v1 owns 3000; v2 lives on 3002 to coexist.
 TEAM="${CC_V2_TEAM:-factory-v3}"
 CC_URL="http://localhost:$PORT"
 
+# ---------- workspace config ----------
+# Selectable per-agent workspaces. Resolution order (highest wins):
+#   1. --gemini=PATH / --claude=PATH on `up`
+#   2. CC_GEMINI_WORKSPACE / CC_CLAUDE_WORKSPACE env (legacy: GEMINI_WORKSPACE / CLAUDE_WORKSPACE)
+#   3. ~/.cc/config.json  ({"workspaces":{"gemini":"/path","claude":"/path"}})
+#   4. internal defaults under packages/workspaces/<agent>
+CC_CONFIG="${CC_CONFIG:-$HOME/.cc/config.json}"
+
+read_config_workspace() {
+  local agent="$1"
+  [ -f "$CC_CONFIG" ] || { echo ""; return; }
+  "$NODE" -e "try{const c=require('$CC_CONFIG');process.stdout.write((c.workspaces&&c.workspaces['$agent'])||'')}catch{process.stdout.write('')}"
+}
+
+write_config_workspace() {
+  local agent="$1" path="$2"
+  mkdir -p "$(dirname "$CC_CONFIG")"
+  "$NODE" -e "
+    const fs=require('fs');
+    let c={};
+    try{c=JSON.parse(fs.readFileSync('$CC_CONFIG','utf8'))}catch{}
+    c.workspaces=c.workspaces||{};
+    c.workspaces['$agent']='$path';
+    fs.writeFileSync('$CC_CONFIG',JSON.stringify(c,null,2)+'\n');
+  "
+  echo "[config] $agent workspace -> $path"
+}
+
+resolve_workspace() {
+  # $1 = agent name (gemini|claude). Echoes resolved path.
+  local agent="$1"
+  local upper="$(echo "$agent" | tr a-z A-Z)"
+  # Per-launch override (set by parse_workspace_flags)
+  local override_var="CC_OVERRIDE_${upper}_WORKSPACE"
+  local override="${!override_var}"
+  if [ -n "$override" ]; then echo "$override"; return; fi
+  # Env var (new + legacy)
+  local env_new_var="CC_${upper}_WORKSPACE"
+  local env_new="${!env_new_var}"
+  if [ -n "$env_new" ]; then echo "$env_new"; return; fi
+  local env_legacy_var="${upper}_WORKSPACE"
+  local env_legacy="${!env_legacy_var}"
+  if [ -n "$env_legacy" ]; then echo "$env_legacy"; return; fi
+  # Persistent config
+  local cfg="$(read_config_workspace "$agent")"
+  if [ -n "$cfg" ]; then echo "$cfg"; return; fi
+  # Default
+  echo "$V2_ROOT/packages/workspaces/$agent"
+}
+
+parse_workspace_flags() {
+  # Strip --gemini=PATH / --claude=PATH out of $@; export overrides.
+  for arg in "$@"; do
+    case "$arg" in
+      --gemini=*) export CC_OVERRIDE_GEMINI_WORKSPACE="${arg#--gemini=}" ;;
+      --claude=*) export CC_OVERRIDE_CLAUDE_WORKSPACE="${arg#--claude=}" ;;
+    esac
+  done
+}
+
 V2_SERVER_ENTRY="$V2_ROOT/packages/server/src/index.js"
 SERVER_PID="$PID_DIR/server.pid"
 CLAUDE_BRIDGE_PID="$PID_DIR/claude-bridge.pid"
@@ -152,7 +212,7 @@ start_claude_bridge() {
   local model="${CLAUDE_CLI_MODEL:-sonnet}"
   local empty_mcp="$V2_ROOT/packages/workspaces/empty-mcp.json"
   local cmd="${CLAUDE_CMD:-claude --model $model --dangerously-skip-permissions --strict-mcp-config --mcp-config $empty_mcp}"
-  local ws="${CLAUDE_WORKSPACE:-$V2_ROOT/packages/workspaces/claude}"
+  local ws="$(resolve_workspace claude)"
   start_tmux_bridge "claude" "${CLAUDE_TMUX_SESSION:-claude-cc}" \
     "unset ANTHROPIC_API_KEY; exec $cmd" "$ws" "$CLAUDE_BRIDGE_PID"
 }
@@ -168,7 +228,7 @@ start_gemini_bridge() {
   local model="${GEMINI_MODEL:-gemini-2.5-flash}"
   # Whitelist a non-existent MCP name → effectively disables all MCP servers.
   local cmd="${GEMINI_CMD:-$bin --model $model --yolo --allowed-mcp-server-names __v2_no_mcp__}"
-  local ws="${GEMINI_WORKSPACE:-$V2_ROOT/packages/workspaces/gemini}"
+  local ws="$(resolve_workspace gemini)"
   start_tmux_bridge "gemini" "${GEMINI_TMUX_SESSION:-gemini-cc}" \
     "unset GEMINI_API_KEY; export GEMINI_CLI_TRUST_WORKSPACE=true; exec $cmd" "$ws" "$GEMINI_BRIDGE_PID"
 }
@@ -182,29 +242,73 @@ start_watchdog() {
 # ---------- subcommands ----------
 
 install_protocols() {
-  # Render v1.4 operator manuals into each worker's workspace so the CLI
-  # picks them up on (re)launch. Idempotent — overwrites every time so
-  # GEMINI.md / CLAUDE.md never drift from the template in this repo.
+  # Render v1.4 operator manuals into each worker's workspace.
+  #
+  # Safe-mode: the protocol always lands at $workspace/.cc/protocol.md
+  # (overwritten freely — it's our generated content). The user-facing
+  # GEMINI.md / CLAUDE.md is then written ONLY if it doesn't already exist;
+  # if it does, we append a managed import block (between markers) so we
+  # don't clobber project-owned content.
   local renderer="$V2_ROOT/packages/shared/src/render-protocol-cli.js"
   [ -f "$renderer" ] || { echo "[protocol] renderer missing — skipping"; return; }
 
-  local gem_ws="${GEMINI_WORKSPACE:-$V2_ROOT/packages/workspaces/gemini}"
-  local cla_ws="${CLAUDE_WORKSPACE:-$V2_ROOT/packages/workspaces/claude}"
-  mkdir -p "$gem_ws" "$cla_ws"
+  local gem_ws="$(resolve_workspace gemini)"
+  local cla_ws="$(resolve_workspace claude)"
+  mkdir -p "$gem_ws/.cc" "$cla_ws/.cc"
 
   "$NODE" "$renderer" --agent gemini --team "$TEAM" --cc-url "$CC_URL" \
     --peer claude:orchestrator --tmux-target gemini-cc:0.0 \
-    > "$gem_ws/GEMINI.md.tmp" && mv "$gem_ws/GEMINI.md.tmp" "$gem_ws/GEMINI.md" \
-    && echo "[protocol] wrote $gem_ws/GEMINI.md"
+    > "$gem_ws/.cc/protocol.md.tmp" && mv "$gem_ws/.cc/protocol.md.tmp" "$gem_ws/.cc/protocol.md" \
+    && _install_manual "$gem_ws/GEMINI.md" "$gem_ws/.cc/protocol.md" "gemini"
 
   "$NODE" "$renderer" --agent claude --team "$TEAM" --cc-url "$CC_URL" \
     --peer gemini:worker --tmux-target claude-cc:0.0 \
-    > "$cla_ws/CLAUDE.md.tmp" && mv "$cla_ws/CLAUDE.md.tmp" "$cla_ws/CLAUDE.md" \
-    && echo "[protocol] wrote $cla_ws/CLAUDE.md"
+    > "$cla_ws/.cc/protocol.md.tmp" && mv "$cla_ws/.cc/protocol.md.tmp" "$cla_ws/.cc/protocol.md" \
+    && _install_manual "$cla_ws/CLAUDE.md" "$cla_ws/.cc/protocol.md" "claude"
+}
+
+_install_manual() {
+  # $1 = path to GEMINI.md / CLAUDE.md, $2 = path to protocol.md, $3 = agent name
+  local manual="$1" proto="$2" agent="$3"
+  local marker_start="<!-- BEGIN cc-protocol -->"
+  local marker_end="<!-- END cc-protocol -->"
+  local block_body
+  block_body="$(cat "$proto")"
+  local block="$marker_start
+$block_body
+$marker_end"
+
+  if [ ! -f "$manual" ]; then
+    printf '%s\n' "$block" > "$manual"
+    echo "[protocol] wrote $manual (new)"
+    return
+  fi
+
+  if grep -q "$marker_start" "$manual"; then
+    # Replace existing managed block in place.
+    "$NODE" -e "
+      const fs=require('fs');
+      const path='$manual', body=fs.readFileSync('$proto','utf8');
+      let cur=fs.readFileSync(path,'utf8');
+      const re=/<!-- BEGIN cc-protocol -->[\s\S]*?<!-- END cc-protocol -->/;
+      cur=cur.replace(re,'<!-- BEGIN cc-protocol -->\n'+body.trim()+'\n<!-- END cc-protocol -->');
+      fs.writeFileSync(path,cur);
+    "
+    echo "[protocol] updated managed block in $manual"
+  else
+    # Existing user file with no managed block — append.
+    printf '\n\n%s\n' "$block" >> "$manual"
+    echo "[protocol] appended managed block to $manual (preserved existing content)"
+  fi
 }
 
 cmd_up() {
+  parse_workspace_flags "$@"
+  local gem_ws="$(resolve_workspace gemini)"
+  local cla_ws="$(resolve_workspace claude)"
   echo "== Control Center UP (port=$PORT, team=$TEAM) =="
+  echo "   gemini workspace: $gem_ws"
+  echo "   claude workspace: $cla_ws"
   install_protocols
   start_server
   start_claude_bridge
@@ -212,6 +316,31 @@ cmd_up() {
   start_watchdog
   start_pane_mirror
   echo "-- done. 'ccctl status' to verify."
+}
+
+cmd_workspace() {
+  # ccctl workspace            -> show current
+  # ccctl workspace <agent> <path>  -> persist new
+  local agent="$1" path="$2"
+  if [ -z "$agent" ]; then
+    echo "== workspaces =="
+    for a in gemini claude; do
+      printf "  %s: %s\n" "$a" "$(resolve_workspace "$a")"
+    done
+    [ -f "$CC_CONFIG" ] && echo "  (config: $CC_CONFIG)"
+    return
+  fi
+  case "$agent" in
+    gemini|claude) ;;
+    *) echo "agent must be gemini or claude"; exit 2 ;;
+  esac
+  if [ -z "$path" ]; then
+    echo "Usage: ccctl workspace $agent /absolute/path"; exit 2
+  fi
+  [ -d "$path" ] || { echo "no such directory: $path"; exit 2; }
+  local abs="$(cd "$path" && pwd)"
+  write_config_workspace "$agent" "$abs"
+  echo "Run 'ccctl restart' (or nuke + up) for $agent to switch into the new workspace."
 }
 
 cmd_down() {
@@ -238,7 +367,7 @@ cmd_nuke() {
   echo "-- nuked."
 }
 
-cmd_restart() { cmd_down; sleep 1; cmd_up; }
+cmd_restart() { cmd_down; sleep 1; cmd_up "$@"; }
 
 cmd_toggle() {
   if is_alive "$SERVER_PID" || is_alive "$WATCHDOG_PID" || is_alive "$MIRROR_PID"; then
@@ -274,23 +403,29 @@ cmd_logs() {
   tail -n 20 -F "$LOG_DIR"/*.log 2>/dev/null
 }
 
-case "${1:-help}" in
-  up|start)      cmd_up ;;
+SUBCMD="${1:-help}"
+shift || true
+case "$SUBCMD" in
+  up|start)      cmd_up "$@" ;;
   down|stop)     cmd_down ;;
   toggle)        cmd_toggle ;;
-  restart)       cmd_restart ;;
+  restart)       cmd_restart "$@" ;;
   nuke)          cmd_nuke ;;
   status)        cmd_status ;;
   logs)          cmd_logs ;;
+  workspace|ws)  cmd_workspace "$@" ;;
   *)
-    echo "Usage: $0 {up|down|toggle|restart|nuke|status|logs}"
-    echo "  up      — start everything"
-    echo "  down    — stop everything (keep tmux sessions warm)"
-    echo "  toggle  — flip current state"
-    echo "  nuke    — down + kill tmux sessions"
-    echo "  restart — down + up"
-    echo "  status  — show what's running"
-    echo "  logs    — tail all component logs"
+    echo "Usage: $0 {up|down|toggle|restart|nuke|status|logs|workspace}"
+    echo "  up [--gemini=PATH] [--claude=PATH]"
+    echo "                — start everything (override workspaces just for this launch)"
+    echo "  down          — stop everything (keep tmux sessions warm)"
+    echo "  toggle        — flip current state"
+    echo "  nuke          — down + kill tmux sessions"
+    echo "  restart       — down + up"
+    echo "  status        — show what's running"
+    echo "  logs          — tail all component logs"
+    echo "  workspace                — show current workspaces"
+    echo "  workspace <agent> <path> — persist workspace for gemini|claude"
     exit 1
     ;;
 esac
