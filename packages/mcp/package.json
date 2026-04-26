@@ -1,1 +1,8 @@
-{"name":"@cc/mcp","version":"0.0.0","type":"module","main":"src/index.js","private":true}
+{
+  "name": "@cc/mcp",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": { "cc2-mcp": "./src/index.js" },
+  "private": true
+}
