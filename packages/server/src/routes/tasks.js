@@ -5,7 +5,60 @@ import { send, sendError, readJson, matchId } from '../http-utils.js';
 import { dispatch } from '../dispatcher.js';
 import { appendMessage } from './messages.js';
 
+function makeSeqId() {
+  return 'seq_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
+}
+
 export async function handleTasks(req, res, url) {
+  // POST /api/tasks/sequence — atomic creation of a serial chain.
+  // Body: { team, assignTo, type, gated?, continueOnFailure?, steps: [payload, ...] }
+  // Step 0 = queued (or awaiting-approval if gated). Steps 1..N-1 = pending-seq.
+  // Each step inherits team/assignTo/type from the envelope unless overridden.
+  if (req.method === 'POST' && url.pathname === '/api/tasks/sequence') {
+    let body;
+    try { body = await readJson(req); }
+    catch (e) { return sendError(res, 400, e.message); }
+    const { team, assignTo, type, gated, continueOnFailure, steps } = body;
+    if (!Array.isArray(steps) || steps.length === 0) {
+      return sendError(res, 400, 'steps must be a non-empty array');
+    }
+    const seqId = makeSeqId();
+    const created = [];
+    try {
+      for (let i = 0; i < steps.length; i++) {
+        const step = steps[i];
+        const stepType = step.type || type;
+        const stepAssignTo = step.assignTo || assignTo;
+        const stepTeam = step.team || team;
+        const stepPayload = step.payload || step;
+        const status = i === 0
+          ? (gated ? 'awaiting-approval' : 'queued')
+          : 'pending-seq';
+        const t = taskStore.create({
+          team: stepTeam,
+          assignTo: stepAssignTo,
+          type: stepType,
+          payload: stepPayload,
+          gated: i === 0 ? !!gated : false,
+          seqId,
+          seqIndex: i,
+          seqTotal: steps.length,
+          continueOnFailure: !!continueOnFailure,
+          status,
+        });
+        created.push(t);
+      }
+      persist();
+      // Dispatch the first task if not gated.
+      if (created[0].status === 'queued') {
+        dispatch(created[0]).catch(e => console.error('[tasks] dispatch:', e.message));
+      }
+      return send(res, 201, { seqId, tasks: created });
+    } catch (e) {
+      return sendError(res, 400, e.message);
+    }
+  }
+
   // POST /api/tasks  — create
   if (req.method === 'POST' && url.pathname === '/api/tasks') {
     let body;
@@ -76,6 +129,28 @@ export async function handleTasks(req, res, url) {
             data: { taskId: id, status: next, result: body.result || null },
           });
         } catch {}
+        // Sequence chain: promote next sibling, or cancel remainder on failure.
+        if (updated.seqId) {
+          try {
+            const siblings = taskStore.listSequence(updated.seqId);
+            if (next === 'completed' || updated.continueOnFailure) {
+              const nextSib = siblings.find(s => s.seqIndex === updated.seqIndex + 1 && s.status === 'pending-seq');
+              if (nextSib) {
+                taskStore.updateStatus(nextSib.id, 'queued');
+                persist();
+                dispatch(nextSib).catch(e => console.error('[tasks] seq dispatch:', e.message));
+              }
+            } else {
+              // Failed and no continueOnFailure → cancel remaining pending-seq.
+              for (const s of siblings) {
+                if (s.seqIndex > updated.seqIndex && s.status === 'pending-seq') {
+                  try { taskStore.updateStatus(s.id, 'cancelled'); } catch {}
+                }
+              }
+              persist();
+            }
+          } catch (e) { console.error('[tasks] seq chain:', e.message); }
+        }
       }
       return send(res, 200, { task: updated });
     } catch (e) {

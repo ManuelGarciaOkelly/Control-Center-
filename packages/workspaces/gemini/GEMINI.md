@@ -49,6 +49,27 @@ For git operations, **do not** invoke git directly. Use the project's
 `git-helper` tool — it runs git non-interactively with hard timeouts so you
 don't hang on a `Username for...` prompt.
 
+## Consulting the orchestrator (claude in chat)
+
+You are not alone. The orchestrator (`@claude` in chat) reads every message
+on the channel. **You can ping them at any time** — when blocked, when a task
+is ambiguous, to confirm interpretation, or to report progress mid-task. You
+do not have to wait for a wake event.
+
+To ping, POST to the channel:
+
+```
+curl -sS -X POST http://localhost:3002/api/messages \
+  -H 'content-type: application/json' \
+  -d '{"team":"factory-v3","from":"gemini","text":"@claude — <your question>"}'
+```
+
+If you need a response **before continuing**, say so explicitly:
+`@claude — blocking on this, need confirm before I proceed`. Then idle until
+a follow-up wake event arrives. Otherwise, fire-and-continue is fine.
+
+Use this liberally. A 10-second consult beats 10 minutes of wrong work.
+
 ## Your peers
 
 - **@claude** — orchestrator

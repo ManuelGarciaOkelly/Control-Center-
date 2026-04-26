@@ -49,11 +49,14 @@ export async function loadState({ path = DEFAULT_PATH } = {}) {
 export async function saveState({ state, path = DEFAULT_PATH }) {
   ensureDir(path);
   const tmp = path + '.tmp';
+  // Inputs may already be arrays of [k,v] pairs (from _exportMap-style helpers)
+  // or live Maps. Normalise once so we never double-wrap on round-trip.
+  const toEntries = (v) => Array.isArray(v) ? v : (v && typeof v.entries === 'function' ? [...v.entries()] : []);
   const payload = {
-    tasks: [...state.tasks.entries()],
+    tasks: toEntries(state.tasks),
     messages: state.messages,
-    teams: [...state.teams.entries()],
-    agentHealth: [...state.agentHealth.entries()],
+    teams: toEntries(state.teams),
+    agentHealth: toEntries(state.agentHealth),
     taskId: state.taskId || 0,
     messageId: state.messageId || 0,
     savedAt: new Date().toISOString(),

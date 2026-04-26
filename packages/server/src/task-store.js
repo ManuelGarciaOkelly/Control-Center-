@@ -2,7 +2,8 @@
 
 const legalTransitions = {
   queued: ['dispatched', 'cancelled'],
-  'awaiting-approval': ['dispatched', 'cancelled'],
+  'awaiting-approval': ['queued', 'dispatched', 'cancelled'],
+  'pending-seq': ['queued', 'cancelled'],
   dispatched: ['acknowledged', 'completed', 'failed', 'cancelled'],
   acknowledged: ['completed', 'failed', 'cancelled'],
   completed: [],
@@ -16,7 +17,7 @@ export class TaskStore {
     this._nextId = 1;
   }
 
-  create({ team, assignTo, type, payload = {}, priority = 0, gated = false }) {
+  create({ team, assignTo, type, payload = {}, priority = 0, gated = false, seqId = null, seqIndex = null, seqTotal = null, continueOnFailure = false, status = null }) {
     if (!team) throw new Error('Missing team for task creation');
     if (!assignTo) throw new Error('Missing assignTo for task creation');
     if (!type) throw new Error('Missing type for task creation');
@@ -33,12 +34,25 @@ export class TaskStore {
       payload,
       priority,
       gated,
-      status: gated ? 'awaiting-approval' : 'queued',
+      status: status || (gated ? 'awaiting-approval' : 'queued'),
       createdAt: now,
       updatedAt: now
     };
+    if (seqId) {
+      task.seqId = seqId;
+      task.seqIndex = seqIndex;
+      task.seqTotal = seqTotal;
+      task.continueOnFailure = !!continueOnFailure;
+    }
     this.tasks.set(task.id, task);
     return task;
+  }
+
+  // Find sibling tasks in the same sequence, sorted by seqIndex.
+  listSequence(seqId) {
+    return Array.from(this.tasks.values())
+      .filter(t => t.seqId === seqId)
+      .sort((a, b) => a.seqIndex - b.seqIndex);
   }
 
   get(id) {

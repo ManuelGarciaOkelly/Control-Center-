@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Control Center Dashboard</title>
+    <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+    <header>
+        <div class="status-dots">
+            <span id="dot-broker" class="status-dot down"></span>
+            <span id="dot-gemini" class="status-dot down"></span>
+            <span id="dot-claude" class="status-dot down"></span>
+        </div>
+        <div class="header-buttons">
+            <button>[Up]</button>
+            <button>[Down]</button>
+            <button>[Restart]</button>
+        </div>
+    </header>
+    <nav>
+        <button class="tab-button active">Channel</button>
+        <button class="tab-button">gemini</button>
+        <button class="tab-button">claude</button>
+        <button class="tab-button">tasks</button>
+    </nav>
+    <main id="stream"></main>
+    <footer>
+        <input type="text" id="composer" placeholder="Type your message...">
+        <button id="send-button">[Send]</button>
+    </footer>
+    <script src="./app.js"></script>
+</body>
+</html>
