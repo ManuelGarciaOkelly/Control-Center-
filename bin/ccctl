@@ -147,9 +147,12 @@ OSA
 }
 
 start_claude_bridge() {
+  # v2 strictly rejects the v1 cc_* MCP — workers reply via tmux pane only.
+  # --strict-mcp-config + an empty mcp config blocks all MCP servers.
   local model="${CLAUDE_CLI_MODEL:-sonnet}"
-  local cmd="${CLAUDE_CMD:-claude --model $model --dangerously-skip-permissions}"
-  local ws="${CLAUDE_WORKSPACE:-$HOME/.config/control-center/claude-workspace}"
+  local empty_mcp="$V2_ROOT/packages/workspaces/empty-mcp.json"
+  local cmd="${CLAUDE_CMD:-claude --model $model --dangerously-skip-permissions --strict-mcp-config --mcp-config $empty_mcp}"
+  local ws="${CLAUDE_WORKSPACE:-$V2_ROOT/packages/workspaces/claude}"
   start_tmux_bridge "claude" "${CLAUDE_TMUX_SESSION:-claude-cc}" \
     "unset ANTHROPIC_API_KEY; exec $cmd" "$ws" "$CLAUDE_BRIDGE_PID"
 }
@@ -163,10 +166,11 @@ start_gemini_bridge() {
     done
   }
   local model="${GEMINI_MODEL:-gemini-2.5-flash}"
-  local cmd="${GEMINI_CMD:-$bin --model $model --yolo}"
-  local ws="${GEMINI_WORKSPACE:-$HOME/.config/control-center/gemini-workspace}"
+  # Whitelist a non-existent MCP name → effectively disables all MCP servers.
+  local cmd="${GEMINI_CMD:-$bin --model $model --yolo --allowed-mcp-server-names __v2_no_mcp__}"
+  local ws="${GEMINI_WORKSPACE:-$V2_ROOT/packages/workspaces/gemini}"
   start_tmux_bridge "gemini" "${GEMINI_TMUX_SESSION:-gemini-cc}" \
-    "unset GEMINI_API_KEY; exec $cmd" "$ws" "$GEMINI_BRIDGE_PID"
+    "unset GEMINI_API_KEY; export GEMINI_CLI_TRUST_WORKSPACE=true; exec $cmd" "$ws" "$GEMINI_BRIDGE_PID"
 }
 
 start_watchdog() {
@@ -177,8 +181,31 @@ start_watchdog() {
 
 # ---------- subcommands ----------
 
+install_protocols() {
+  # Render v1.4 operator manuals into each worker's workspace so the CLI
+  # picks them up on (re)launch. Idempotent — overwrites every time so
+  # GEMINI.md / CLAUDE.md never drift from the template in this repo.
+  local renderer="$V2_ROOT/packages/shared/src/render-protocol-cli.js"
+  [ -f "$renderer" ] || { echo "[protocol] renderer missing — skipping"; return; }
+
+  local gem_ws="${GEMINI_WORKSPACE:-$V2_ROOT/packages/workspaces/gemini}"
+  local cla_ws="${CLAUDE_WORKSPACE:-$V2_ROOT/packages/workspaces/claude}"
+  mkdir -p "$gem_ws" "$cla_ws"
+
+  "$NODE" "$renderer" --agent gemini --team "$TEAM" --cc-url "$CC_URL" \
+    --peer claude:orchestrator --tmux-target gemini-cc:0.0 \
+    > "$gem_ws/GEMINI.md.tmp" && mv "$gem_ws/GEMINI.md.tmp" "$gem_ws/GEMINI.md" \
+    && echo "[protocol] wrote $gem_ws/GEMINI.md"
+
+  "$NODE" "$renderer" --agent claude --team "$TEAM" --cc-url "$CC_URL" \
+    --peer gemini:worker --tmux-target claude-cc:0.0 \
+    > "$cla_ws/CLAUDE.md.tmp" && mv "$cla_ws/CLAUDE.md.tmp" "$cla_ws/CLAUDE.md" \
+    && echo "[protocol] wrote $cla_ws/CLAUDE.md"
+}
+
 cmd_up() {
   echo "== Control Center UP (port=$PORT, team=$TEAM) =="
+  install_protocols
   start_server
   start_claude_bridge
   start_gemini_bridge

@@ -42,6 +42,21 @@ const CHROME = [
   /^\s*[│]\s*[!*>]\s+$/,
   /^\s*~\/[\w./-]+\s*$/,
   /^\s*\(.+\)\s*\d+\s*(window|attached)/,
+  // Spinner + "Thinking..." status line (braille spinner glyphs ⠁-⣿).
+  /[\u2800-\u28FF].*Thinking\.\.\./,
+  /Thinking\.\.\.\s*\(esc to cancel/,
+  // gemini-cli MCP tool-call echo lines (we no longer want to mirror these
+  // since v2 protocol forbids cc_send_message). Match the box-edge + "✓ tool"
+  // form and the "Message sent (id: ...)" confirmation.
+  /^\s*│\s*[✓✗]\s+\w+.*\(.*MCP/,
+  /Message sent \(id:\s*\d+\)/,
+  // gemini-cli startup banner & footer status bar.
+  /Gemini CLI v\d/,
+  /Signed in with Google/,
+  /Plan:\s*Gemini Code Assist/,
+  /no sandbox\s+gemini-/,
+  // "potential loop detected" advisory (we'd rather see a real recovery msg)
+  /A potential loop was detected/,
 ];
 
 const isChrome = line => CHROME.some(re => re.test(line));
