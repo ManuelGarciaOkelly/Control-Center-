@@ -21,16 +21,93 @@ set -e
 V2_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 V2_AGENTS_DIR="$V2_ROOT/packages/agents/src"
 V2_BRIDGES_DIR="$V2_ROOT/packages/bridges/src"
-LOG_DIR="/tmp/cc-v2"
-PID_DIR="$LOG_DIR/pids"
-mkdir -p "$LOG_DIR" "$PID_DIR"
 
 NODE="/Users/playground/.local/node-v22.13.1-darwin-arm64/bin/node"
 [ -x "$NODE" ] || NODE="$(command -v node)"
 
-PORT="${CC_V2_PORT:-3002}"  # v1 owns 3000; v2 lives on 3002 to coexist.
+# ---------- multi-instance ----------
+# An "instance" is one full stack (broker + bridges + watchdog + mirror) for a
+# specific workspace folder. Default instance id is "default" (back-compat).
+# Each instance gets its own port, pidfiles, logs, tmux sessions, state.json,
+# and registry entry under ~/.cc/instances/<id>/.
+#
+# Resolution order for instance id:
+#   1. --instance=<id> on the command line (parsed by parse_instance_flag)
+#   2. CC_V2_INSTANCE env
+#   3. "default"
+parse_instance_flag() {
+  for arg in "$@"; do
+    case "$arg" in
+      --instance=*) export CC_V2_INSTANCE="${arg#--instance=}" ;;
+    esac
+  done
+}
+parse_instance_flag "$@"
+INSTANCE="${CC_V2_INSTANCE:-default}"
+# Sanitize: lowercase, alnum + dash only.
+INSTANCE="$(echo "$INSTANCE" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed -E 's/-+/-/g; s/^-|-$//g')"
+[ -z "$INSTANCE" ] && INSTANCE="default"
+
+REGISTRY="$HOME/.cc/registry.json"
+# Default instance keeps the legacy paths for back-compat.
+if [ "$INSTANCE" = "default" ]; then
+  INSTANCE_DIR="$HOME/.cc"
+  STATE_PATH="$HOME/.cc/state.json"
+  LOG_DIR="/tmp/cc-v2"
+else
+  INSTANCE_DIR="$HOME/.cc/instances/$INSTANCE"
+  STATE_PATH="$INSTANCE_DIR/state.json"
+  LOG_DIR="/tmp/cc-v2/$INSTANCE"
+fi
+PID_DIR="$LOG_DIR/pids"
+mkdir -p "$LOG_DIR" "$PID_DIR" "$INSTANCE_DIR" "$(dirname "$REGISTRY")"
+
+# Port allocation. Default instance keeps 3002 for back-compat; others
+# auto-allocate from 3100-3199 (or take CC_V2_PORT if set).
+allocate_port() {
+  if [ -n "$CC_V2_PORT" ]; then echo "$CC_V2_PORT"; return; fi
+  if [ "$INSTANCE" = "default" ]; then echo "3002"; return; fi
+  # Reuse port if this instance is already in the registry.
+  if [ -f "$REGISTRY" ]; then
+    local existing
+    existing="$("$NODE" -e "try{const r=JSON.parse(require('fs').readFileSync('$REGISTRY','utf8'));process.stdout.write(String((r['$INSTANCE']&&r['$INSTANCE'].port)||''))}catch{}")"
+    [ -n "$existing" ] && { echo "$existing"; return; }
+  fi
+  for p in $(seq 3100 3199); do
+    lsof -ti ":$p" >/dev/null 2>&1 || { echo "$p"; return; }
+  done
+  echo "[ccctl] no free port in 3100-3199" >&2; exit 1
+}
+
+PORT="$(allocate_port)"
 TEAM="${CC_V2_TEAM:-factory-v3}"
 CC_URL="http://localhost:$PORT"
+
+registry_write() {
+  # $1 = status (up|down)
+  local status="$1"
+  local gem_ws="$(resolve_workspace gemini 2>/dev/null || echo '')"
+  local cla_ws="$(resolve_workspace claude 2>/dev/null || echo '')"
+  "$NODE" -e "
+    const fs=require('fs'), path='$REGISTRY';
+    let r={};
+    try{r=JSON.parse(fs.readFileSync(path,'utf8'))}catch{}
+    r['$INSTANCE']={port:$PORT,status:'$status',gemini:'$gem_ws',claude:'$cla_ws',ts:new Date().toISOString()};
+    fs.mkdirSync(require('path').dirname(path),{recursive:true});
+    fs.writeFileSync(path,JSON.stringify(r,null,2)+'\n');
+  " 2>/dev/null || true
+}
+
+registry_remove() {
+  [ -f "$REGISTRY" ] || return
+  "$NODE" -e "
+    const fs=require('fs'), path='$REGISTRY';
+    let r={};
+    try{r=JSON.parse(fs.readFileSync(path,'utf8'))}catch{}
+    delete r['$INSTANCE'];
+    fs.writeFileSync(path,JSON.stringify(r,null,2)+'\n');
+  " 2>/dev/null || true
+}
 
 # ---------- workspace config ----------
 # Selectable per-agent workspaces. Resolution order (highest wins):
@@ -146,6 +223,8 @@ start_server() {
 
   CC_PORT="$PORT" PORT="$PORT" \
   CC_TEAM="$TEAM" \
+  CC_STATE_PATH="$STATE_PATH" \
+  CC_INSTANCE="$INSTANCE" \
     launch "server" "$SERVER_PID" "$LOG_DIR/server.log" "$NODE" "$entry"
 
   for i in 1 2 3 4 5 6 7 8 9 10; do
@@ -213,7 +292,9 @@ start_claude_bridge() {
   local empty_mcp="$V2_ROOT/packages/workspaces/empty-mcp.json"
   local cmd="${CLAUDE_CMD:-claude --model $model --dangerously-skip-permissions --strict-mcp-config --mcp-config $empty_mcp}"
   local ws="$(resolve_workspace claude)"
-  start_tmux_bridge "claude" "${CLAUDE_TMUX_SESSION:-claude-cc}" \
+  local sess="${CLAUDE_TMUX_SESSION:-${INSTANCE}-claude-cc}"
+  [ "$INSTANCE" = "default" ] && sess="${CLAUDE_TMUX_SESSION:-claude-cc}"
+  start_tmux_bridge "claude" "$sess" \
     "unset ANTHROPIC_API_KEY; exec $cmd" "$ws" "$CLAUDE_BRIDGE_PID"
 }
 
@@ -229,7 +310,9 @@ start_gemini_bridge() {
   # Whitelist a non-existent MCP name → effectively disables all MCP servers.
   local cmd="${GEMINI_CMD:-$bin --model $model --yolo --allowed-mcp-server-names __v2_no_mcp__}"
   local ws="$(resolve_workspace gemini)"
-  start_tmux_bridge "gemini" "${GEMINI_TMUX_SESSION:-gemini-cc}" \
+  local sess="${GEMINI_TMUX_SESSION:-${INSTANCE}-gemini-cc}"
+  [ "$INSTANCE" = "default" ] && sess="${GEMINI_TMUX_SESSION:-gemini-cc}"
+  start_tmux_bridge "gemini" "$sess" \
     "unset GEMINI_API_KEY; export GEMINI_CLI_TRUST_WORKSPACE=true; exec $cmd" "$ws" "$GEMINI_BRIDGE_PID"
 }
 
@@ -306,7 +389,7 @@ cmd_up() {
   parse_workspace_flags "$@"
   local gem_ws="$(resolve_workspace gemini)"
   local cla_ws="$(resolve_workspace claude)"
-  echo "== Control Center UP (port=$PORT, team=$TEAM) =="
+  echo "== Control Center UP (instance=$INSTANCE, port=$PORT, team=$TEAM) =="
   echo "   gemini workspace: $gem_ws"
   echo "   claude workspace: $cla_ws"
   install_protocols
@@ -315,7 +398,8 @@ cmd_up() {
   start_gemini_bridge
   start_watchdog
   start_pane_mirror
-  echo "-- done. 'ccctl status' to verify."
+  registry_write "up"
+  echo "-- done. dashboard: $CC_URL/  ('ccctl status' to verify)"
 }
 
 cmd_workspace() {
@@ -356,15 +440,65 @@ cmd_down() {
   pkill -f "control-center-v2/packages/agents/src/watchdog.js"     2>/dev/null || true
   pkill -f "control-center-v2/packages/agents/src/pane-mirror.js"  2>/dev/null || true
   # Tmux sessions left intact so the CLIs keep their warm state.
+  registry_write "down"
   echo "-- done. Tmux sessions left intact (use 'ccctl nuke' to also drop them)."
 }
 
 cmd_nuke() {
   cmd_down
-  for s in claude-cc gemini-cc; do
+  local cs="claude-cc" gs="gemini-cc"
+  [ "$INSTANCE" != "default" ] && cs="${INSTANCE}-claude-cc" && gs="${INSTANCE}-gemini-cc"
+  for s in "$cs" "$gs"; do
     tmux kill-session -t "$s" 2>/dev/null && echo "  killed tmux session $s" || true
   done
+  registry_remove
   echo "-- nuked."
+}
+
+cmd_ls() {
+  echo "== instances =="
+  if [ ! -f "$REGISTRY" ]; then echo "  (none registered)"; return; fi
+  "$NODE" -e "
+    const fs=require('fs');
+    const r=JSON.parse(fs.readFileSync('$REGISTRY','utf8'));
+    const cp=require('child_process');
+    const ids=Object.keys(r);
+    if(!ids.length){console.log('  (none)');return;}
+    for(const id of ids){
+      const i=r[id];
+      let alive=false;
+      try{cp.execSync('lsof -ti :'+i.port,{stdio:'ignore'});alive=true}catch{}
+      const tag=alive?'UP  ':'down';
+      console.log(\`  [\${tag}] \${id.padEnd(20)} :\${i.port}  \${i.gemini||''}\`);
+      if(!alive && i.status==='up'){
+        // Lazy reap stale registry entry.
+        i.status='down';
+      }
+    }
+    fs.writeFileSync('$REGISTRY',JSON.stringify(r,null,2)+'\n');
+  "
+}
+
+cmd_here() {
+  # ccctl here [folder]  — instance per folder. Derives id from basename.
+  local folder="${1:-$PWD}"
+  [ -d "$folder" ] || { echo "no such directory: $folder"; exit 2; }
+  local abs="$(cd "$folder" && pwd)"
+  local id="$(basename "$abs" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed -E 's/-+/-/g; s/^-|-$//g')"
+  [ -z "$id" ] && id="ws"
+  # If id collides with a different folder in the registry, suffix -2/-3/...
+  if [ -f "$REGISTRY" ]; then
+    local n=2
+    while "$NODE" -e "
+      const r=JSON.parse(require('fs').readFileSync('$REGISTRY','utf8'));
+      const i=r['$id'];
+      process.exit(i && i.gemini && i.gemini!=='$abs' ? 0 : 1);
+    " 2>/dev/null; do
+      id="${id%-*}-$n"; n=$((n+1))
+    done
+  fi
+  echo "[here] folder=$abs instance=$id"
+  exec "$0" up "--instance=$id" "--gemini=$abs" "--claude=$abs"
 }
 
 cmd_restart() { cmd_down; sleep 1; cmd_up "$@"; }
@@ -391,7 +525,9 @@ cmd_status() {
   done
   echo ""
   echo "== tmux sessions =="
-  tmux ls 2>/dev/null | grep -E 'claude-cc|gemini-cc' || echo "  (none)"
+  local pat="claude-cc|gemini-cc"
+  [ "$INSTANCE" != "default" ] && pat="${INSTANCE}-claude-cc|${INSTANCE}-gemini-cc"
+  tmux ls 2>/dev/null | grep -E "$pat" || echo "  (none)"
   echo ""
   echo "== CC health ($CC_URL) =="
   curl -sf "$CC_URL/api/health" 2>/dev/null | python3 -m json.tool 2>/dev/null \
@@ -414,8 +550,10 @@ case "$SUBCMD" in
   status)        cmd_status ;;
   logs)          cmd_logs ;;
   workspace|ws)  cmd_workspace "$@" ;;
+  ls|list)       cmd_ls ;;
+  here)          cmd_here "$@" ;;
   *)
-    echo "Usage: $0 {up|down|toggle|restart|nuke|status|logs|workspace}"
+    echo "Usage: $0 {up|down|toggle|restart|nuke|status|logs|workspace|ls|here} [--instance=<id>]"
     echo "  up [--gemini=PATH] [--claude=PATH]"
     echo "                — start everything (override workspaces just for this launch)"
     echo "  down          — stop everything (keep tmux sessions warm)"
@@ -426,6 +564,8 @@ case "$SUBCMD" in
     echo "  logs          — tail all component logs"
     echo "  workspace                — show current workspaces"
     echo "  workspace <agent> <path> — persist workspace for gemini|claude"
+    echo "  ls                       — list registered instances and liveness"
+    echo "  here [folder]            — start instance for folder (id=basename)"
     exit 1
     ;;
 esac
